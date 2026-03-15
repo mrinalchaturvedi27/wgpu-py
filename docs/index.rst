@@ -9,6 +9,7 @@ Welcome to the wgpu-py docs!
 
     start
     guide
+    compute_guide
     wgpu
     backends
     utils
