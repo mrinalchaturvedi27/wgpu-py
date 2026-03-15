@@ -667,3 +667,392 @@ Under the hood:
    buffer).
 2. Pass 2: use ``dispatch_workgroups_indirect`` where the dispatch counts are
    computed by pass 1 (advanced: requires an atomic counter in the first pass).
+
+
+9. GPU Performance Engineering
+-------------------------------
+
+This section teaches you to think like a GPU performance engineer.  Matrix
+multiplication is used throughout as the concrete running example because it
+exercises every optimization axis at once.
+
+The complete, annotated example is in ``examples/compute_perf_matmul.py``.
+
+
+9.1 Choosing Workgroup Sizes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The workgroup size (the argument to ``@workgroup_size`` in WGSL) is the single
+most important tuning knob for a compute shader.
+
+**Warp / wavefront alignment**
+
+Hardware executes threads in *warps* (NVIDIA, 32 threads) or *wavefronts* (AMD,
+64 threads).  If your workgroup size is not a multiple of the warp size, the
+last warp contains idle lanes:
+
+.. code-block:: text
+
+    warp size = 32
+    workgroup size = 40  →  warp 0: threads 0–31 (full)
+                             warp 1: threads 32–39 ACTIVE, 40–63 IDLE (25% waste)
+
+    workgroup size = 64  →  warp 0: threads 0–31 (full)
+                             warp 1: threads 32–63 (full)  ← no waste
+
+Rule of thumb: **always use a multiple of 64** (safe on both 32- and 64-thread
+hardware).
+
+**1-D problems (e.g. vector addition)**
+
+Common good values: ``64``, ``128``, ``256``.  Larger workgroups increase the
+number of threads the scheduler can use to hide memory latency, but beyond
+~256 threads you rarely gain further benefit.
+
+.. code-block:: wgsl
+
+    @compute @workgroup_size(256)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) { ... }
+
+**2-D problems (e.g. matrix multiplication)**
+
+Use a square tile of side ``TILE``, giving ``TILE × TILE`` threads per workgroup.
+
+.. code-block:: wgsl
+
+    @compute @workgroup_size(16, 16, 1)   // 256 threads, TILE=16
+    fn main(...) { ... }
+
+Dispatch enough workgroups to cover the output matrix:
+
+.. code-block:: python
+
+    import math
+    wg_x = math.ceil(N / TILE)
+    wg_y = math.ceil(M / TILE)
+    pass_.dispatch_workgroups(wg_x, wg_y, 1)
+
+**Why TILE=16 is often optimal**
+
+With TILE=16 each workgroup has 256 threads, which is:
+
+* A multiple of 64 (warp-aligned on both AMD and NVIDIA).
+* Small enough that many workgroups can be live simultaneously on each SM
+  (high occupancy).
+* Large enough to reuse each tile element 16 times before the next global
+  memory fetch (good arithmetic intensity).
+
+
+9.2 Memory Tiling
+~~~~~~~~~~~~~~~~~~
+
+Tiling is the technique of partitioning the problem into *tiles* that fit in
+fast on-chip workgroup (shared) memory, loading each tile once from slow global
+memory, and reusing it many times.
+
+**Naive matmul – global memory bottleneck**
+
+.. code-block:: wgsl
+
+    // Each thread independently computes one element of C.
+    // Thread (row, col) reads K elements from A's row and K from B's col.
+    var acc: f32 = 0.0;
+    for (var k: u32 = 0u; k < K; k++) {
+        acc += A[row * K + k] * B[k * N + col];
+    }
+
+Total global reads: ``2 × M × N × K`` floats.  For a 1024×1024 square matmul
+that is ~2 billion reads, easily saturating global memory bandwidth.
+
+**Tiled matmul – data reuse**
+
+A workgroup of TILE×TILE threads cooperatively loads a TILE×TILE sub-block of
+A and one of B into workgroup memory, then every thread in the workgroup reuses
+those values TILE times before the next load:
+
+.. code-block:: wgsl
+
+    var<workgroup> tile_a: array<f32, TILE * TILE>;
+    var<workgroup> tile_b: array<f32, TILE * TILE>;
+
+    for (var t: u32 = 0u; t < num_tiles; t++) {
+        // --- all TILE*TILE threads load one element each ---
+        tile_a[lrow * TILE + lcol] = A[row * K + t * TILE + lcol];
+        tile_b[lrow * TILE + lcol] = B[(t * TILE + lrow) * N + col];
+        workgroupBarrier();
+
+        // --- all threads compute TILE multiply-adds using on-chip data ---
+        for (var k = 0u; k < TILE; k++) {
+            acc += tile_a[lrow * TILE + k] * tile_b[k * TILE + lcol];
+        }
+        workgroupBarrier();
+    }
+
+Global reads with tiling: ``2 × M × N × K / TILE`` — a **TILE× reduction** in
+global memory traffic.  For TILE=16 and a 1024×1024 matrix that is ~125 million
+reads instead of 2 billion.
+
+**The two-barrier pattern**
+
+Two ``workgroupBarrier()`` calls are essential:
+
+1. **After loading tiles** – ensures every element is written before any thread
+   reads them (prevents read-before-write races).
+2. **After accumulating** – ensures every thread finishes reading before any
+   thread overwrites the tile for the next iteration (prevents
+   write-after-read races).
+
+
+9.3 Avoiding Bank Conflicts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Workgroup (shared) memory is implemented as an array of SRAM *banks*.  Most
+modern GPUs have **32 banks**, each 4 bytes wide.  A float stored at byte
+offset ``b`` lives in bank ``(b / 4) % 32``.
+
+**What is a bank conflict?**
+
+A bank conflict occurs when two or more threads in the same warp access
+*different addresses* that map to the *same bank*.  The hardware must serialize
+those accesses, adding one extra cycle per conflicting thread.
+
+**Bank conflicts in a square tile**
+
+With a tile of width TILE stored in row-major order (stride = TILE), the
+address of element ``(row, col)`` is ``tile[row * TILE + col]``.
+
+During the accumulation loop, thread ``(lrow, lcol)`` reads column ``k`` from
+``tile_a``:
+
+.. code-block:: text
+
+    tile_a[lrow * TILE + k]
+
+All threads with the same ``lrow`` (i.e., the same warp row) read the same
+element — that is a *broadcast*, which hardware handles efficiently (no
+conflict).
+
+The problem is when threads in the *same warp column* read the same column
+from ``tile_b``:
+
+.. code-block:: text
+
+    tile_b[k * TILE + lcol]
+
+Here the row ``k`` varies across iterations, and the stride between rows is
+exactly TILE floats.  When TILE is a multiple of the number of banks (32),
+consecutive rows fall on the same bank:
+
+.. code-block:: text
+
+    TILE=32: row 0 → bank 0, row 1 → bank (32 % 32) = 0, row 2 → bank 0, …
+    → 32-way bank conflict per warp!
+
+**The padding fix (stride = TILE + 1)**
+
+Declare the workgroup arrays with a *padded row stride* of ``TILE + 1``:
+
+.. code-block:: wgsl
+
+    const TILE_PAD: u32 = TILE + 1;
+    var<workgroup> tile_a: array<f32, TILE * TILE_PAD>;
+    var<workgroup> tile_b: array<f32, TILE * TILE_PAD>;
+
+Access with the padded stride:
+
+.. code-block:: wgsl
+
+    tile_a[lrow * TILE_PAD + lcol]  // load
+    tile_a[lrow * TILE_PAD + k]     // accumulate
+
+Now row spacing = ``(TILE + 1) * 4`` bytes.  For TILE=16:
+``17 * 4 = 68 bytes → bank 17 ≠ bank 0`` — successive rows land on
+different banks.  For TILE=32: ``33 * 4 = 132 bytes → bank 1 ≠ bank 0``.
+
+The padding wastes ``TILE × 4`` bytes per tile (one extra column of floats),
+but the throughput improvement on real hardware is substantial for TILE=32.
+
+See ``examples/compute_perf_matmul.py`` for the complete implementation with
+inline analysis of which threads land on which banks.
+
+**Verifying the fix**
+
+Use a GPU profiler (NVIDIA Nsight Compute, AMD Radeon GPU Profiler) to inspect
+the ``l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld`` counter.  After
+applying padding it should drop to near zero.
+
+
+9.4 Minimising Global Memory Access
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Every byte fetched from VRAM costs ~100–200 ns of latency and consumes precious
+memory bandwidth.  The strategies below systematically reduce global memory
+traffic.
+
+**1. Exploit data reuse with tiling** (see §9.2)
+
+The fundamental technique: move data from global → workgroup memory once,
+then reuse it ``TILE`` times.
+
+**2. Coalesced access – load consecutive addresses per warp**
+
+All threads in the same warp should access a contiguous, aligned block of
+global memory.  The hardware then issues a single wide read transaction
+(128 bytes on most GPUs) instead of N separate ones.
+
+Good (coalesced):
+
+.. code-block:: wgsl
+
+    // Thread lcol=0 reads col 0, lcol=1 reads col 1, …, lcol=15 reads col 15.
+    // Addresses: row*K+t*TILE+0, row*K+t*TILE+1, …, row*K+t*TILE+15 → contiguous.
+    tile_a[lrow * TILE_PAD + lcol] = mat_a[row * K + t * TILE + lcol];
+
+Bad (strided):
+
+.. code-block:: wgsl
+
+    // If instead threads accessed different rows of A, addresses would be
+    // spaced K floats apart → separate memory transactions per thread.
+    tile_a[lrow * TILE_PAD + lcol] = mat_a[(row + lcol) * K + t * TILE];
+
+**3. Use uniform / constant buffers for small read-only data**
+
+Pipeline parameters (matrix dimensions, scaling factors) should live in a
+``var<uniform>`` buffer, not a storage buffer.  The GPU caches uniform data
+in a dedicated constant cache that is much faster than the L2 path used for
+storage buffers.
+
+.. code-block:: wgsl
+
+    @group(0) @binding(3) var<uniform> dims: vec4<u32>;  // M, K, N, pad
+
+**4. Read/write once per element**
+
+The output ``mat_c`` is written exactly once per thread, at the very end of
+the kernel after all tiles have been accumulated.  Avoid writing partial
+results to global memory mid-kernel — that would add extra expensive stores.
+
+**5. Arithmetic intensity**
+
+*Arithmetic intensity* = FLOPs / bytes transferred.  Optimising a shader means
+increasing this ratio.  For matrix multiplication:
+
+.. code-block:: text
+
+    FLOPs = 2 * M * N * K  (one multiply + one add per inner-product step)
+    Bytes (naive)  = 2 * M * N * K * 4   → intensity = 0.5 FLOP/byte (DRAM-bound)
+    Bytes (TILE=16) = 2 * M * N * K / 16 * 4 → intensity = 8 FLOP/byte (closer to compute-bound)
+
+Hardware rooflines (representative values):
+
++--------------------+--------------------+-------------------+
+| GPU class          | Peak FP32 (TFLOP/s)| Mem BW (TB/s)     |
++====================+====================+===================+
+| Mid-range discrete | 10–20              | 0.3–0.6           |
++--------------------+--------------------+-------------------+
+| High-end discrete  | 40–80              | 1–3               |
++--------------------+--------------------+-------------------+
+
+The *ridge point* (the minimum arithmetic intensity required to be
+compute-bound rather than memory-bound) is roughly ``Peak FP32 / Mem BW``,
+typically **30–100 FLOP/byte** for modern discrete GPUs.
+
+TILE=16 gives ~8 FLOP/byte — still below the ridge point, so larger tiles
+(TILE=32) or register tiling can push towards compute-bound operation.
+
+
+9.5 Occupancy Considerations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+*Occupancy* is the fraction of the maximum number of resident warps that are
+actually active on a streaming multiprocessor (SM) at any moment.
+
+High occupancy is desirable because the GPU hides memory latency by switching
+to another ready warp while the current warp waits for data.  With low
+occupancy there are not enough warps to hide latency and the SMs stall.
+
+**Resources that limit occupancy**
+
++---------------------------+--------------------------------------------------+
+| Resource                  | Effect of excessive use                          |
++===========================+==================================================+
+| Threads per SM            | Too many threads per workgroup → fewer           |
+|                           | workgroups resident on the SM                   |
++---------------------------+--------------------------------------------------+
+| Workgroup (shared) memory | Too many bytes per workgroup → fewer workgroups  |
+|                           | fit in the SM's on-chip SRAM                    |
++---------------------------+--------------------------------------------------+
+| Registers per thread      | Too many registers → fewer threads per SM        |
++---------------------------+--------------------------------------------------+
+
+**Occupancy formula (simplified)**
+
+For a shader with ``threads_per_wg`` threads and ``smem_per_wg`` bytes of
+workgroup memory:
+
+.. code-block:: text
+
+    max_threads_per_SM  ≈ 2048  (typical modern GPU)
+    max_smem_per_SM     ≈ 49152 bytes (48 KB)
+    max_wg_per_SM_threads = max_threads_per_SM // threads_per_wg
+    max_wg_per_SM_smem   = max_smem_per_SM    // smem_per_wg
+    active_wg_per_SM     = min(max_wg_per_SM_threads, max_wg_per_SM_smem)
+    occupancy            = active_wg_per_SM * threads_per_wg / max_threads_per_SM
+
+**TILE=16 example**
+
+.. code-block:: text
+
+    threads_per_wg   = 16 * 16  = 256
+    smem_per_wg      = 2 * 16 * 17 * 4  = 2176 bytes  (with TILE_PAD=17)
+
+    max_wg (threads) = 2048 // 256  = 8
+    max_wg (smem)    = 49152 // 2176 = 22
+    active_wg        = min(8, 22)   = 8      ← thread-bound
+    occupancy        = 8 * 256 / 2048 = 100%
+
+**TILE=32 example**
+
+.. code-block:: text
+
+    threads_per_wg   = 32 * 32  = 1024
+    smem_per_wg      = 2 * 32 * 33 * 4  = 8448 bytes  (with TILE_PAD=33)
+
+    max_wg (threads) = 2048 // 1024 = 2
+    max_wg (smem)    = 49152 // 8448 = 5
+    active_wg        = min(2, 5)    = 2      ← thread-bound
+    occupancy        = 2 * 1024 / 2048 = 100%
+
+Both TILE=16 and TILE=32 reach 100% occupancy on this model GPU, but TILE=32
+has only 2 active workgroups/SM compared to 8 for TILE=16.  With fewer
+concurrent workgroups there is less opportunity to hide the latency of the
+``workgroupBarrier()`` stalls, so TILE=16 often performs better in practice.
+
+**Occupancy vs arithmetic intensity trade-off**
+
+Increasing TILE improves arithmetic intensity (fewer global reads per FLOP)
+but reduces concurrency (fewer workgroups per SM).  The optimal tile size
+depends on the hardware's memory latency and bandwidth.  Always measure:
+
+.. code-block:: python
+
+    # Use compute_timestamps.py as a template:
+    device = adapter.request_device_sync(
+        required_features=[wgpu.FeatureName.timestamp_query]
+    )
+    # ... setup query_set and pass timestamp_writes to begin_compute_pass ...
+
+**Practical recommendations**
+
+1. Start with TILE=16 (256 threads, a safe default on all modern GPUs).
+2. Profile with ``compute_timestamps.py`` at TILE=8, 16, 32.
+3. Prefer smaller tiles when the matrix K dimension is small (fewer
+   reuse opportunities mean tiling overhead dominates).
+4. Use a GPU profiler to check occupancy and memory efficiency counters
+   rather than relying solely on analytic estimates.
+
+**Exercise 9:** Open ``examples/compute_perf_matmul.py``, run it with TILE=8,
+16, and 32, and compare the printed performance summaries.  Then add GPU
+timestamp queries (see ``examples/compute_timestamps.py``) to measure actual
+kernel execution time and compute the achieved GFLOP/s for each tile size.
