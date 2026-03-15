@@ -252,7 +252,257 @@ See ``examples/compute_vector_add.py`` for the full 1-D pipeline and
 command encoder → compute pass) and draw a dependency diagram.
 
 
-4. WGSL Compute Shaders
+4. WGSL Language Fundamentals
+------------------------------
+
+This section is a concise reference for the WGSL features used in compute
+shaders.  Readers who know C++ or Rust will find the syntax familiar.
+
+
+Shader Structure and Entry Points
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A WGSL source file consists of top-level declarations (bindings, globals,
+structs, functions) followed by one or more entry-point functions.  For compute
+shaders the entry point is annotated with ``@compute``:
+
+.. code-block:: wgsl
+
+    // 1. Bindings (connect to host-side buffers)
+    @group(0) @binding(0) var<storage, read_write> output: array<f32>;
+
+    // 2. Optional module-scope constants
+    const PI: f32 = 3.14159265;
+
+    // 3. Optional helper function (no entry-point annotation)
+    fn square(x: f32) -> f32 { return x * x; }
+
+    // 4. Compute entry point
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+        output[gid.x] = square(f32(gid.x)) * PI;
+    }
+
+Key rules:
+
+* ``@compute`` marks the function as the compute entry point.
+* ``@workgroup_size(x, y, z)`` declares the workgroup dimensions; ``y`` and
+  ``z`` default to ``1``.
+* Built-in inputs (``gid``, ``lid``, ``wid``) are declared as function
+  parameters with ``@builtin(…)`` annotations – they are *not* global
+  variables.
+* There is no ``main`` rule: any function name is valid as an entry point.
+  One shader module can contain multiple entry points with different names.
+
+There are three kinds of entry points, but compute shaders only use ``@compute``:
+
++----------------+-----------------------------------------+
+| Annotation     | Use                                     |
++================+=========================================+
+| ``@compute``   | GPU compute kernel                      |
++----------------+-----------------------------------------+
+| ``@vertex``    | Vertex shader (graphics pipeline)       |
++----------------+-----------------------------------------+
+| ``@fragment``  | Fragment / pixel shader (graphics)      |
++----------------+-----------------------------------------+
+
+
+Scalar Types
+~~~~~~~~~~~~~
+
++----------+--------------------------------------+--------------------+
+| Type     | Description                          | Literal example    |
++==========+======================================+====================+
+| ``f32``  | 32-bit IEEE 754 float                | ``3.14``, ``0.0``  |
++----------+--------------------------------------+--------------------+
+| ``i32``  | 32-bit signed integer                | ``-42``, ``0``     |
++----------+--------------------------------------+--------------------+
+| ``u32``  | 32-bit unsigned integer              | ``10u``, ``0u``    |
++----------+--------------------------------------+--------------------+
+| ``bool`` | Boolean                              | ``true``, ``false``|
++----------+--------------------------------------+--------------------+
+
+Explicit casts use the type name as a function: ``f32(my_u32)``,
+``u32(my_f32)``.  WGSL does **not** perform implicit numeric conversions.
+
+
+Vector Types
+~~~~~~~~~~~~~
+
+Vectors hold 2, 3, or 4 scalar components:
+
+.. code-block:: wgsl
+
+    var v2: vec2<f32> = vec2<f32>(1.0, 2.0);
+    var v3: vec3<u32> = vec3<u32>(0u, 1u, 2u);
+    var v4: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+
+    // Component access
+    let x: f32 = v2.x;           // .x .y .z .w
+    let r: f32 = v4.r;           // .r .g .b .a  (alias for .x .y .z .w)
+
+    // Arithmetic is component-wise
+    let sum: vec2<f32> = v2 + vec2<f32>(3.0, 4.0);
+
+    // Built-in vector operations
+    let d: f32  = dot(v3, v3);
+    let n: vec3<f32> = normalize(vec3<f32>(1.0, 2.0, 3.0));
+
+The ``@builtin(global_invocation_id)`` is a ``vec3<u32>`` – the x/y/z
+components address the thread's position in the 3-D workgroup grid.
+
+
+Matrix Types
+~~~~~~~~~~~~~
+
+Matrix types are ``mat{C}x{R}<f32>`` where *C* is the number of **columns**
+and *R* is the number of **rows**:
+
+.. code-block:: wgsl
+
+    var m: mat4x4<f32>;                       // 4 columns × 4 rows
+    var m2: mat2x3<f32>;                      // 2 columns × 3 rows
+
+    // Column-major construction: mat2x2(col0_r0, col0_r1, col1_r0, col1_r1)
+    let identity = mat2x2<f32>(1.0, 0.0,  0.0, 1.0);
+
+    // Matrix × vector (right-multiply)
+    let v: vec4<f32> = m * vec4<f32>(1.0, 2.0, 3.0, 1.0);
+
+    // Column access
+    let col0: vec4<f32> = m[0];
+
+Note: the WGSL standard library only supports matrix operations up to 4×4.
+For larger matrices (e.g., neural-network weight matrices) use ``array<f32>``
+in storage buffers and implement the indexing manually – as shown in
+``examples/compute_matmul.py`` and ``examples/compute_tiled_matmul.py``.
+
+
+Array Types
+~~~~~~~~~~~~
+
+.. code-block:: wgsl
+
+    // Fixed-size array – usable anywhere, required for var<workgroup>
+    var fixed: array<f32, 16>;
+    fixed[0] = 1.0;
+
+    // Runtime-sized array – only allowed in storage buffers
+    @group(0) @binding(0) var<storage, read_write> data: array<f32>;
+    // arrayLength(&data) returns the number of elements at runtime.
+
+    let n: u32 = arrayLength(&data);
+
+
+Struct Types
+~~~~~~~~~~~~~
+
+Structs group related data.  The host must pack the struct in the **same
+memory layout** (same field order, same alignment):
+
+.. code-block:: wgsl
+
+    struct Params {
+        n      : u32,    // offset 0, size 4
+        stride : u32,    // offset 4, size 4
+        scale  : f32,    // offset 8, size 4
+        pad    : u32,    // offset 12 – explicit padding to reach 16-byte size
+    }
+
+    @group(0) @binding(2) var<uniform> params: Params;
+
+    // Access fields with dot notation
+    let length = params.n;
+
+On the Python host side, use ``struct.pack`` to create the matching byte
+layout:
+
+.. code-block:: python
+
+    import struct
+    data = struct.pack("IIfI", n, stride, scale, 0)   # I=uint32, f=float32
+
+WGSL alignment rules (simplified):
+
+* ``u32``, ``i32``, ``f32`` – 4-byte aligned.
+* ``vec2<f32>`` – 8-byte aligned.
+* ``vec4<f32>`` – 16-byte aligned.
+* Structs used in uniforms must be **16-byte aligned** (pad to a multiple of
+  16 bytes).
+
+
+Variable Storage Classes
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The storage class is specified in the ``var<…>`` declaration and determines
+where the variable lives, its lifetime, and access rules:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 20 60
+
+   * - Storage class
+     - Location
+     - Notes
+   * - ``var<storage, read>``
+     - GPU VRAM
+     - Read-only storage buffer.  Connected to a host buffer via ``@group``/``@binding``.
+   * - ``var<storage, read_write>``
+     - GPU VRAM
+     - Writable storage buffer.  The host buffer must have ``BufferUsage.STORAGE``.
+   * - ``var<uniform>``
+     - GPU constant cache
+     - Small (≤64 KB), read-only.  Faster than storage for constant data.
+       The host buffer needs ``BufferUsage.UNIFORM``.
+   * - ``var<workgroup>``
+     - On-chip SRAM
+     - Shared among all threads in one workgroup only.  Very fast, but limited
+       (typically 16–64 KB per workgroup).  Must be fixed-size array.  Declared
+       at module scope, not inside functions.
+   * - ``var<private>``
+     - Thread registers
+     - Private to each invocation.  Declared at module scope, but each thread
+       has its own copy.
+   * - ``var`` (function scope)
+     - Thread registers
+     - Equivalent to ``var<function>``, the default for local variables.
+       Each thread invocation has its own copy.
+
+Minimal example illustrating all classes:
+
+.. code-block:: wgsl
+
+    // Module-scope declarations
+    @group(0) @binding(0) var<storage, read>       input  : array<f32>;
+    @group(0) @binding(1) var<storage, read_write> output : array<f32>;
+    @group(0) @binding(2) var<uniform>             params : vec2<u32>;
+
+    var<workgroup> shared_tile: array<f32, 64>;  // on-chip shared memory
+    var<private>   thread_flag: bool = false;    // per-thread flag
+
+    @compute @workgroup_size(64)
+    fn main(
+        @builtin(global_invocation_id) gid : vec3<u32>,
+        @builtin(local_invocation_id)  lid : vec3<u32>,
+    ) {
+        // Function-scope variable (same as var<function>)
+        var accumulator: f32 = 0.0;
+
+        // Load into shared memory
+        shared_tile[lid.x] = input[gid.x];
+        workgroupBarrier();
+
+        // Use shared memory and accumulate
+        accumulator += shared_tile[lid.x];
+        output[gid.x] = accumulator;
+    }
+
+**Exercise 3b:** Modify the minimal shader above to use a ``struct`` instead of
+``vec2<u32>`` for the uniform, and add a ``scale: f32`` field that multiplies
+the output.
+
+
+5. WGSL Compute Shaders
 -----------------------
 
 Storage Buffers
@@ -334,7 +584,7 @@ sum) of an array using workgroup memory.  Hint: the parallel prefix-sum
 algorithm needs exactly ``log2(WORKGROUP_SIZE)`` barrier-separated passes.
 
 
-5. Memory and Performance
+6. Memory and Performance
 --------------------------
 
 GPU Memory Types Summary
@@ -395,7 +645,7 @@ Performance Considerations
 timing.
 
 
-6. Build a Compute Program
+7. Build a Compute Program
 --------------------------
 
 A. Vector Addition
@@ -413,8 +663,63 @@ Key steps:
 6. Submit and read results back with ``queue.read_buffer``.
 
 
-B. Naive Matrix Multiplication
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+B. Parallel Reduction (Sum)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+See ``examples/compute_reduction.py`` for the full, annotated implementation.
+
+The key challenge: summing N numbers using thousands of threads in parallel.
+A naive approach (one thread loops over all N) is slower than a CPU loop
+because the GPU parallelism is entirely wasted.
+
+The *parallel reduction* algorithm uses a logarithmic tree:
+
+1. Each workgroup of WORKGROUP_SIZE threads loads WORKGROUP_SIZE elements into
+   ``var<workgroup> scratch``.
+2. A ``workgroupBarrier()`` ensures all threads have finished loading.
+3. The threads reduce in log₂(WORKGROUP_SIZE) barrier-separated rounds,
+   halving the active thread count each round.
+4. Thread 0 writes the workgroup sum to a ``partials[]`` buffer.
+5. A second dispatch reduces all partial sums to the final total.
+
+.. code-block:: wgsl
+
+    var<workgroup> scratch: array<f32, 256>;
+
+    @compute @workgroup_size(256)
+    fn reduce_pass1(
+        @builtin(global_invocation_id) gid : vec3<u32>,
+        @builtin(local_invocation_id)  lid : vec3<u32>,
+        @builtin(workgroup_id)         wid : vec3<u32>,
+    ) {
+        let n = params.n;
+        // Load element (guard: pad with 0 if out of bounds)
+        scratch[lid.x] = select(0.0, data[gid.x], gid.x < n);
+        workgroupBarrier();
+
+        // Tree reduction: log2(256) = 8 rounds
+        var stride: u32 = 128u;
+        loop {
+            if (stride == 0u) { break; }
+            if (lid.x < stride) {
+                scratch[lid.x] += scratch[lid.x + stride];
+            }
+            workgroupBarrier();
+            stride = stride >> 1u;
+        }
+        // Thread 0 stores the workgroup sum
+        if (lid.x == 0u) { partials[wid.x] = scratch[0]; }
+    }
+
+Thread indexing in this example:
+
+* ``gid.x`` – global element index across all workgroups.
+* ``lid.x`` – local index within the workgroup (0..255).
+* ``wid.x`` – which workgroup this thread belongs to.
+
+
+C. Matrix Multiplication
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 See ``examples/compute_matmul.py`` for the existing naive implementation.
 
@@ -439,7 +744,7 @@ The bottleneck is global-memory bandwidth: each thread re-reads the same rows
 and columns of A and B over and over from slow VRAM.
 
 
-C. Tiled Matrix Multiplication with Shared Memory
+D. Tiled Matrix Multiplication with Shared Memory
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 See ``examples/compute_tiled_matmul.py`` for the full implementation.
@@ -463,12 +768,12 @@ repeats for the next block along the K dimension.
 Global memory reads per element: reduced from O(K) to O(K / TILE) — a TILE×
 speedup in memory traffic.
 
-**Exercise 6:** Implement the multi-pass version: after computing C = A @ B,
+**Exercise 7:** Implement the multi-pass version: after computing C = A @ B,
 add a second compute pass that element-wise multiplies C by a scaling vector
 stored in a separate buffer.  Verify against NumPy.
 
 
-7. Debugging and Profiling
+8. Debugging and Profiling
 --------------------------
 
 Validation Layers
@@ -563,12 +868,12 @@ Common GPU Compute Bugs
 | Wrong format in ``memoryview.cast`` | Wrong numbers in output                   |
 +-------------------------------------+-------------------------------------------+
 
-**Exercise 7:** Intentionally remove a ``workgroupBarrier()`` from
+**Exercise 8:** Intentionally remove a ``workgroupBarrier()`` from
 ``examples/compute_tiled_matmul.py`` and add an assertion.  Run it several
 times – does it fail consistently or only sometimes?
 
 
-8. Advanced Topics
+9. Advanced Topics
 ------------------
 
 Indirect Dispatch
@@ -661,7 +966,7 @@ Under the hood:
    Metal, etc.).
 6. The GPU driver schedules execution across its SMs according to occupancy.
 
-**Exercise 8:** Implement a two-pass compute pipeline that:
+**Exercise 9:** Implement a two-pass compute pipeline that:
 
 1. Pass 1: mark all values > threshold in an array (write 1 or 0 into a flag
    buffer).
